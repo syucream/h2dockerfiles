@@ -1,0 +1,2187 @@
+diff --git a/configure.ac b/configure.ac
+index db11f1d..a8cc1f8 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -394,6 +394,19 @@ AC_SUBST(has_spdy)
+ AM_CONDITIONAL([BUILD_SPDY], [test 0 -ne $has_spdy])
+ 
+ #
++# Options for HTTP2
++#
++AC_MSG_CHECKING([whether to enable http2])
++AC_ARG_ENABLE([http2],
++	[AS_HELP_STRING([--enable-http2], [turn on http2 protocol])],
++	[],
++	[enable_http2="no"])
++AC_MSG_RESULT([$enable_http2])
++TS_ARG_ENABLE_VAR([has], [http2])
++AC_SUBST(has_http2)
++AM_CONDITIONAL([BUILD_HTTP2], [test 0 -ne $has_http2])
++
++#
+ # Configure how many stats to allocate for plugins. Default is 512.
+ #
+ AC_ARG_WITH([max-api-stats],
+@@ -1415,6 +1428,11 @@ if test "x${enable_spdy}" = "xyes"; then
+   PKG_CHECK_MODULES([SPDYLAY],[libspdylay])
+ fi
+ 
++# Check for nghttp2 library
++if test "x${enable_http2}" = "xyes"; then
++  PKG_CHECK_MODULES([NGHTTP2],[libnghttp2])
++fi
++
+ # -----------------------------------------------------------------------------
+ # 5. CHECK FOR HEADER FILES
+ 
+@@ -1944,6 +1962,7 @@ AC_CONFIG_FILES([
+   proxy/logging/Makefile
+   proxy/shared/Makefile
+   proxy/spdy/Makefile
++  proxy/http2/Makefile
+   rc/Makefile
+   rc/trafficserver
+   rc/trafficserver.conf
+diff --git a/iocore/net/SSLNextProtocolSet.cc b/iocore/net/SSLNextProtocolSet.cc
+index 325af27..7992500 100644
+--- a/iocore/net/SSLNextProtocolSet.cc
++++ b/iocore/net/SSLNextProtocolSet.cc
+@@ -165,6 +165,21 @@ SSLNextProtocolSet::NextProtocolEndpoint::NextProtocolEndpoint(
+         const char * _proto, Continuation * _ep)
+   : protocol(_proto),  endpoint(_ep)
+ {
++# if 0
++  if (proto == TS_NPN_PROTOCOL_HTTP_1_1 ||
++      proto == TS_NPN_PROTOCOL_HTTP_1_0) {
++    proto_stack = ((1u << TS_PROTO_TLS) | (1u << TS_PROTO_HTTP));
++  } else if (proto == TS_NPN_PROTOCOL_SPDY_3_1 ||
++             proto == TS_NPN_PROTOCOL_SPDY_3 ||
++             proto == TS_NPN_PROTOCOL_SPDY_2 ||
++             proto == TS_NPN_PROTOCOL_SPDY_1) {
++    proto_stack = ((1u << TS_PROTO_TLS) | (1u << TS_PROTO_SPDY));
++  } else if (proto == TS_NPN_PROTOCOL_HTTP_2_0) {
++    proto_stack = ((1u << TS_PROTO_TLS) | (1u << TS_PROTO_HTTP2));
++  } else {
++    proto_stack = (1u << TS_PROTO_TLS);
++  }
++# endif
+ }
+ 
+ SSLNextProtocolSet::NextProtocolEndpoint::~NextProtocolEndpoint()
+diff --git a/lib/atscppapi/src/HttpVersion.cc b/lib/atscppapi/src/HttpVersion.cc
+index 7a1e3d5..28d47ff 100644
+--- a/lib/atscppapi/src/HttpVersion.cc
++++ b/lib/atscppapi/src/HttpVersion.cc
+@@ -25,5 +25,7 @@
+ const std::string atscppapi::HTTP_VERSION_STRINGS[] = { std::string("UNKNOWN"),
+                                                         std::string("HTTP/0.9"),
+                                                         std::string("HTTP/1.0"),
+-                                                        std::string("HTTP/1.1") };
++                                                        std::string("HTTP/1.1"),
++                                                        std::string("HTTP/2"),
++                                                        };
+ 
+diff --git a/lib/atscppapi/src/include/atscppapi/HttpVersion.h b/lib/atscppapi/src/include/atscppapi/HttpVersion.h
+index fdbd639..594f959 100644
+--- a/lib/atscppapi/src/include/atscppapi/HttpVersion.h
++++ b/lib/atscppapi/src/include/atscppapi/HttpVersion.h
+@@ -37,6 +37,7 @@ enum HttpVersion {
+   HTTP_VERSION_0_9,
+   HTTP_VERSION_1_0,
+   HTTP_VERSION_1_1,
++  HTTP_VERSION_2,
+ };
+ 
+ /**
+diff --git a/lib/atscppapi/src/include/utils_internal.h b/lib/atscppapi/src/include/utils_internal.h
+index 7cef956..fdf0b3a 100644
+--- a/lib/atscppapi/src/include/utils_internal.h
++++ b/lib/atscppapi/src/include/utils_internal.h
+@@ -29,6 +29,7 @@
+ 
+ #include <ts/ts.h>
+ #include <string>
++#include "ink_config.h"
+ #include "atscppapi/GlobalPlugin.h"
+ #include "atscppapi/TransactionPlugin.h"
+ #include "atscppapi/TransformationPlugin.h"
+diff --git a/lib/atscppapi/src/utils_internal.cc b/lib/atscppapi/src/utils_internal.cc
+index a63b59f..3e3ea0d 100644
+--- a/lib/atscppapi/src/utils_internal.cc
++++ b/lib/atscppapi/src/utils_internal.cc
+@@ -222,6 +222,11 @@ HttpVersion utils::internal::getHttpVersion(TSMBuffer hdr_buf, TSMLoc hdr_loc) {
+     }
+     if ((TS_HTTP_MAJOR(version) == 1) && (TS_HTTP_MINOR(version) == 1)) {
+       return HTTP_VERSION_1_1;
++#if TS_HAS_HTTP2
++    }
++    if ((TS_HTTP_MAJOR(version) == 2) && (TS_HTTP_MINOR(version) == 0)) {
++      return HTTP_VERSION_2;
++#endif
+     } else {
+       LOG_ERROR("Unrecognized version %d", version);
+     }
+diff --git a/lib/records/RecHttp.cc b/lib/records/RecHttp.cc
+index 753a3c1..23aedbd 100644
+--- a/lib/records/RecHttp.cc
++++ b/lib/records/RecHttp.cc
+@@ -36,7 +36,7 @@ SessionProtocolNameRegistry globalSessionProtocolNameRegistry;
+ const char * const TS_NPN_PROTOCOL_HTTP_0_9 = "http/0.9";
+ const char * const TS_NPN_PROTOCOL_HTTP_1_0 = "http/1.0";
+ const char * const TS_NPN_PROTOCOL_HTTP_1_1 = "http/1.1";
+-const char * const TS_NPN_PROTOCOL_HTTP_2   = "http/2";
++const char * const TS_NPN_PROTOCOL_HTTP_2   = "h2-12";    // To support draft-12
+ const char * const TS_NPN_PROTOCOL_SPDY_1   = "spdy/1";   // obsolete
+ const char * const TS_NPN_PROTOCOL_SPDY_2   = "spdy/2";
+ const char * const TS_NPN_PROTOCOL_SPDY_3   = "spdy/3";
+diff --git a/lib/ts/apidefs.h.in b/lib/ts/apidefs.h.in
+index 130b91b..fa9777f 100644
+--- a/lib/ts/apidefs.h.in
++++ b/lib/ts/apidefs.h.in
+@@ -1124,7 +1124,7 @@ extern "C"
+   extern tsapi const char * const TS_NPN_PROTOCOL_HTTP_0_9;
+   extern tsapi const char * const TS_NPN_PROTOCOL_HTTP_1_0;
+   extern tsapi const char * const TS_NPN_PROTOCOL_HTTP_1_1;
+-  extern tsapi const char * const TS_NPN_PROTOCOL_HTTP_2_0;
++  extern tsapi const char * const TS_NPN_PROTOCOL_HTTP_2;
+   extern tsapi const char * const TS_NPN_PROTOCOL_SPDY_1;
+   extern tsapi const char * const TS_NPN_PROTOCOL_SPDY_2;
+   extern tsapi const char * const TS_NPN_PROTOCOL_SPDY_3;
+@@ -1137,7 +1137,7 @@ extern "C"
+   extern tsapi int TS_NPN_PROTOCOL_INDEX_SPDY_2;
+   extern tsapi int TS_NPN_PROTOCOL_INDEX_SPDY_3;
+   extern tsapi int TS_NPN_PROTOCOL_INDEX_SPDY_3_1;
+-  extern tsapi int TS_NPN_PROTOCOL_INDEX_HTTP_2_0;
++  extern tsapi int TS_NPN_PROTOCOL_INDEX_HTTP_2;
+ 
+   extern tsapi const char * const TS_NPN_PROTOCOL_GROUP_HTTP;
+   extern tsapi const char * const TS_NPN_PROTOCOL_GROUP_HTTP2;
+diff --git a/lib/ts/ink_config.h.in b/lib/ts/ink_config.h.in
+index 9d88417..98f561c 100644
+--- a/lib/ts/ink_config.h.in
++++ b/lib/ts/ink_config.h.in
+@@ -72,6 +72,7 @@
+ #define TS_USE_TLS_ECKEY               @use_tls_eckey@
+ #define TS_USE_LINUX_NATIVE_AIO        @use_linux_native_aio@
+ #define TS_USE_INTERIM_CACHE           @has_interim_cache@
++#define TS_HAS_HTTP2                   @has_http2@
+ 
+ 
+ /* OS API definitions */
+diff --git a/proxy/Makefile.am b/proxy/Makefile.am
+index e40c8e9..e229054 100644
+--- a/proxy/Makefile.am
++++ b/proxy/Makefile.am
+@@ -17,7 +17,7 @@
+ #  limitations under the License.
+ 
+ # Note that hdrs is targeted from ../Makefile.am
+-SUBDIRS = congest http spdy logging config
++SUBDIRS = congest http spdy http2 logging config
+ noinst_LIBRARIES =
+ bin_PROGRAMS = \
+   traffic_server \
+@@ -193,6 +193,7 @@ traffic_server_LDFLAGS = @EXTRA_CXX_LDFLAGS@ @LIBTOOL_LINK_FLAGS@
+ traffic_server_LDADD = \
+   http/libhttp.a \
+   spdy/libspdy.a \
++  http2/libhttp2.a \
+   http/remap/libhttp_remap.a \
+   congest/libCongestionControl.a \
+   logging/liblogging.a \
+@@ -230,6 +231,7 @@ traffic_server_LDADD = \
+   @LIBLZMA@ \
+   @LIBPROFILER@ \
+   @SPDYLAY_LIBS@ \
++  @NGHTTP2_LIBS@ \
+   -lm
+ 
+ 
+@@ -300,6 +302,7 @@ traffic_sac_LDFLAGS = @EXTRA_CXX_LDFLAGS@ @LIBTOOL_LINK_FLAGS@
+ traffic_sac_LDADD = \
+   http/libhttp.a \
+   spdy/libspdy.a \
++  http2/libhttp2.a \
+   shared/libdiagsconfig.a \
+   http/remap/libhttp_remap.a \
+   congest/libCongestionControl.a \
+@@ -323,7 +326,7 @@ traffic_sac_LDADD = \
+   $(top_builddir)/lib/records/librecprocess.a \
+   $(top_builddir)/lib/ts/libtsutil.la \
+   @LIBRESOLV@ @LIBPCRE@ @OPENSSL_LIBS@ @LIBTCL@ @HWLOC_LIBS@ \
+-  @LIBEXPAT@ @LIBDEMANGLE@ @LIBZ@ @LIBLZMA@ @LIBPROFILER@ @SPDYLAY_LIBS@ -lm
++  @LIBEXPAT@ @LIBDEMANGLE@ @LIBZ@ @LIBLZMA@ @LIBPROFILER@ @SPDYLAY_LIBS@ @NGHTTP2_LIBS@ -lm
+ 
+ if BUILD_TESTS
+   traffic_sac_SOURCES += RegressionSM.cc
+diff --git a/proxy/ProtocolProbeSessionAccept.cc b/proxy/ProtocolProbeSessionAccept.cc
+index 46adb48..85afee8 100644
+--- a/proxy/ProtocolProbeSessionAccept.cc
++++ b/proxy/ProtocolProbeSessionAccept.cc
+@@ -28,7 +28,7 @@
+ 
+ struct ProtocolProbeTrampoline : public Continuation, public ProtocolProbeSessionAcceptEnums
+ {
+-  static const size_t minimum_read_size = 1;
++  static const size_t minimum_read_size = 4;
+   static const unsigned buffer_size_index = CLIENT_CONNECTION_FIRST_READ_BUFFER_SIZE_INDEX;
+ 
+   explicit
+@@ -77,6 +77,10 @@ struct ProtocolProbeTrampoline : public Continuation, public ProtocolProbeSessio
+     // that no other protocol could possibly ever set this bit!
+     if ((uint8_t)(*reader->start()) == 0x80u) {
+       key = PROTO_SPDY;
++    } else if ((uint8_t)(*reader->start())     == 'P' &&
++               (uint8_t)(*(reader->start()+1)) == 'R' &&
++               (uint8_t)(*(reader->start()+2)) == 'I') { // TODO: check strictly whether recv buffer contains client connection header or not.
++      key = PROTO_HTTP2;
+     } else {
+       key = PROTO_HTTP;
+     }
+diff --git a/proxy/hdrs/HTTP.cc b/proxy/hdrs/HTTP.cc
+index 5933381..75cc8c1 100644
+--- a/proxy/hdrs/HTTP.cc
++++ b/proxy/hdrs/HTTP.cc
+@@ -395,8 +395,18 @@ http_hdr_version_to_string(int32_t version, char *buf9)
+   buf9[3] = 'P';
+   buf9[4] = '/';
+   buf9[5] = '0' + HTTP_MAJOR(version);
++#if TS_HAS_HTTP2
++  if (HTTP_MAJOR(version) >= 2) {
++    buf9[6] = '\0';
++    buf9[7] = '\0';
++  } else {
++    buf9[6] = '.';
++    buf9[7] = '0' + HTTP_MINOR(version);
++  }
++#else
+   buf9[6] = '.';
+   buf9[7] = '0' + HTTP_MINOR(version);
++#endif
+   buf9[8] = '\0';
+ 
+   return (buf9);
+@@ -461,7 +471,7 @@ http_hdr_print(HdrHeap *heap, HTTPHdrImpl *hdr, char *buf, int bufsize, int *buf
+ 
+       if (bufsize - *bufindex >= 9) {
+         http_hdr_version_to_string(hdr->m_version, p);
+-        *bufindex += 9 - 1;     // overwrite '\0';
++        *bufindex += 9 - (*(p + 6) == '\0' ? 3 : 1);     // overwrite '\0';
+       } else {
+         TRY(http_version_print(hdr->m_version, buf, bufsize, bufindex, dumpoffset));
+       }
+@@ -501,9 +511,10 @@ http_hdr_print(HdrHeap *heap, HTTPHdrImpl *hdr, char *buf, int bufsize, int *buf
+ 
+       p = buf + *bufindex;
+       http_hdr_version_to_string(hdr->m_version, p);
+-      p += 8;                   // overwrite '\0' with space
++      tmplen = 9 - (*(p + 6) == '\0' ? 3 : 1);    // overwrite '\0' with space
++      p += tmplen;
+       *p++ = ' ';
+-      *bufindex += 9;
++      *bufindex += tmplen + 1;
+ 
+       hdrstat = http_hdr_status_get(hdr);
+       if (hdrstat == 200) {
+@@ -1010,6 +1021,10 @@ http_parser_parse_req(HTTPParser *parser, HdrHeap *heap, HTTPHdrImpl *hh, const
+       GETPREV(parse_url);
+       goto parse_version3;
+     }
++    if (*cur == '/') {
++      GETPREV(parse_url);
++      goto parse_version4;
++    }
+     goto parse_url;
+   parse_version3:
+     if (ParseRules::is_digit(*cur)) {
+@@ -1200,6 +1215,11 @@ http_parser_parse_resp(HTTPParser *parser, HdrHeap *heap, HTTPHdrImpl *hh, const
+       GETNEXT(eoh);
+       goto parse_version3;
+     }
++    if (ParseRules::is_ws(*cur)) {
++      version_end = cur;
++      GETNEXT(eoh);
++      goto parse_status1;
++    }
+     goto eoh;
+   parse_version3:
+     if (ParseRules::is_digit(*cur)) {
+@@ -1296,8 +1316,7 @@ http_parse_version(const char *start, const char *end)
+ {
+   int maj;
+   int min;
+-
+-  if ((end - start) < 8) {
++  if ((end - start) < 6) {
+     return HTTP_VERSION(0, 9);
+   }
+ 
+@@ -1314,13 +1333,15 @@ http_parse_version(const char *start, const char *end)
+       start += 1;
+     }
+ 
+-    if (*start == '.') {
+-      start += 1;
+-    }
++    if (start != end) {
++        if (*start == '.') {
++          start += 1;
++        }
+ 
+-    while ((start != end) && ParseRules::is_digit(*start)) {
+-      min = (min * 10) + (*start - '0');
+-      start += 1;
++        while ((start != end) && ParseRules::is_digit(*start)) {
++          min = (min * 10) + (*start - '0');
++          start += 1;
++        }
+     }
+ 
+     return HTTP_VERSION(maj, min);
+diff --git a/proxy/hdrs/URL.cc b/proxy/hdrs/URL.cc
+index 65930e9..6a6195f 100644
+--- a/proxy/hdrs/URL.cc
++++ b/proxy/hdrs/URL.cc
+@@ -373,7 +373,6 @@ URLImpl::strings_length()
+   ret += m_len_params;
+   ret += m_len_query;
+   ret += m_len_fragment;
+-  ret += m_len_printed_string;
+   return ret;
+ }
+ 
+diff --git a/proxy/http/HttpProxyServerMain.cc b/proxy/http/HttpProxyServerMain.cc
+index 9eb9291..992806f 100644
+--- a/proxy/http/HttpProxyServerMain.cc
++++ b/proxy/http/HttpProxyServerMain.cc
+@@ -37,6 +37,7 @@
+ #include "P_SSLNextProtocolAccept.h"
+ #include "ProtocolProbeSessionAccept.h"
+ #include "SpdySessionAccept.h"
++#include "Http2SessionAccept.h"
+ 
+ HttpSessionAccept *plugin_http_accept = NULL;
+ HttpSessionAccept *plugin_http_transparent_accept = 0;
+@@ -184,6 +185,11 @@ MakeHttpProxyAcceptor(HttpProxyAcceptor& acceptor, HttpProxyPort& port, unsigned
+   }
+ #endif
+ 
++#if TS_HAS_HTTP2
++  Http2SessionAccept *http2 = new Http2SessionAccept(http);
++  probe->registerEndpoint(ProtocolProbeSessionAccept::PROTO_HTTP2, http2);
++#endif
++
+   if (port.isSSL()) {
+     SSLNextProtocolAccept *ssl = new SSLNextProtocolAccept(probe);
+ 
+@@ -214,6 +220,12 @@ MakeHttpProxyAcceptor(HttpProxyAcceptor& acceptor, HttpProxyPort& port, unsigned
+     }
+ #endif
+ 
++    // HTTP2
++#if TS_HAS_HTTP2
++    if (port.m_session_protocol_preference.contains(TS_NPN_PROTOCOL_INDEX_HTTP_2))
++      ssl->registerEndpoint(TS_NPN_PROTOCOL_HTTP_2, http2);
++#endif
++
+     ink_scoped_mutex lock(ssl_plugin_mutex);
+     ssl_plugin_acceptors.push(ssl);
+ 
+diff --git a/proxy/http/HttpTransactHeaders.cc b/proxy/http/HttpTransactHeaders.cc
+index 9be81d0..14e560c 100644
+--- a/proxy/http/HttpTransactHeaders.cc
++++ b/proxy/http/HttpTransactHeaders.cc
+@@ -264,6 +264,10 @@ HttpTransactHeaders::convert_response(HTTPVersion outgoing_ver, HTTPHdr *outgoin
+     convert_to_1_0_response_header(outgoing_response);
+   } else if (outgoing_ver == HTTPVersion(1, 1)) {
+     convert_to_1_1_response_header(outgoing_response);
++#if TS_HAS_HTTP2
++  } else if (outgoing_ver == HTTPVersion(2, 0)) {
++    convert_to_2_0_response_header(outgoing_response);
++#endif
+   } else if (outgoing_ver == HTTPVersion(0, 9)) {
+     // Http 0.9 is a special case - do not bother copying over fields,
+     // because they will all need to be removed anyway.
+@@ -381,6 +385,20 @@ HttpTransactHeaders::convert_to_1_1_response_header(HTTPHdr *outgoing_response)
+   outgoing_response->version_set(HTTPVersion(1, 1));
+ }
+ 
++#if TS_HAS_HTTP2
++////////////////////////////////////////////////////////////////////////
++// Take an existing outgoing response header and make it HTTP/1.1
++void
++HttpTransactHeaders::convert_to_2_0_response_header(HTTPHdr *outgoing_response)
++{
++  // These are required
++  ink_assert(outgoing_response->status_get());
++
++  // Set HTTP version to 2
++  outgoing_response->version_set(HTTPVersion(2, 0));
++}
++
++#endif
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+ // Name       : calculate_document_age()
+diff --git a/proxy/http/HttpTransactHeaders.h b/proxy/http/HttpTransactHeaders.h
+index cc6f475..76d4079 100644
+--- a/proxy/http/HttpTransactHeaders.h
++++ b/proxy/http/HttpTransactHeaders.h
+@@ -53,6 +53,9 @@ public:
+   static void convert_to_0_9_response_header(HTTPHdr * outgoing_response);
+   static void convert_to_1_0_response_header(HTTPHdr * outgoing_response);
+   static void convert_to_1_1_response_header(HTTPHdr * outgoing_response);
++#if TS_HAS_HTTP2
++  static void convert_to_2_0_response_header(HTTPHdr * outgoing_response);
++#endif
+ 
+   static ink_time_t calculate_document_age(ink_time_t request_time, ink_time_t response_time,
+                                            HTTPHdr * base_response, ink_time_t base_response_date, ink_time_t now);
+diff --git a/proxy/http/Makefile.am b/proxy/http/Makefile.am
+index 8ff6985..258b1ee 100644
+--- a/proxy/http/Makefile.am
++++ b/proxy/http/Makefile.am
+@@ -32,7 +32,8 @@ AM_CPPFLAGS = \
+   -I$(top_srcdir)/proxy/shared \
+   -I$(top_srcdir)/proxy/http/remap \
+   -I$(top_srcdir)/proxy/logging \
+-  -I$(top_srcdir)/proxy/spdy
++  -I$(top_srcdir)/proxy/spdy \
++  -I$(top_srcdir)/proxy/http2
+ 
+ noinst_HEADERS = HttpProxyServerMain.h
+ noinst_LIBRARIES = libhttp.a
+diff --git a/proxy/http2/Http2Callbacks.cc b/proxy/http2/Http2Callbacks.cc
+new file mode 100644
+index 0000000..ee96a19
+--- /dev/null
++++ b/proxy/http2/Http2Callbacks.cc
+@@ -0,0 +1,469 @@
++/** @file
++
++  Http2Callbacks.cc
++
++  @section license License
++
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#include "Http2Callbacks.h"
++#include "Http2ClientSession.h"
++#include <arpa/inet.h>
++
++void
++http2_callbacks_init(nghttp2_session_callbacks * callbacks)
++{
++  memset(callbacks, 0, sizeof(nghttp2_session_callbacks));
++
++  callbacks->send_callback = http2_send_callback;
++  callbacks->recv_callback = http2_recv_callback;
++  callbacks->on_frame_recv_callback = http2_on_frame_recv_callback;
++  callbacks->on_invalid_frame_recv_callback = http2_on_invalid_frame_recv_callback;
++  callbacks->on_data_chunk_recv_callback = http2_on_data_chunk_recv_callback;
++  callbacks->before_frame_send_callback = http2_before_frame_send_callback;
++  callbacks->on_frame_send_callback = http2_on_frame_send_callback;
++  callbacks->on_frame_not_send_callback = http2_on_frame_not_send_callback;
++  callbacks->on_stream_close_callback = http2_on_stream_close_callback;
++  callbacks->on_unknown_frame_recv_callback = http2_on_unknown_frame_recv_callback;
++  callbacks->on_begin_headers_callback = http2_on_begin_headers_callback;
++  callbacks->on_header_callback = http2_on_header_callback;
++  callbacks->select_padding_callback = http2_select_padding_callback;
++}
++
++void
++http2_prepare_status_response(Http2ClientSession * sm, int stream_id, const char *status)
++{
++  Http2Request *req = sm->req_map[stream_id];
++  char date_str[32];
++  mime_format_date(date_str, time(0));
++
++  std::vector < nghttp2_nv > nv;
++  nv.push_back(make_nv_lc(":status", status));
++  nv.push_back(make_nv_ls("server", HTTP2D_SERVER));
++  nv.push_back(make_nv_lc("date", date_str));
++  for (size_t i = 0; i < req->headers.size(); ++i) {
++    nv.push_back(make_nv_ss(req->headers[i].first, req->headers[i].second));
++  }
++
++  int r = nghttp2_submit_response(sm->session, stream_id, nv.data(), nv.size(), NULL);
++  TSAssert(r == 0);
++
++  TSVIOReenable(sm->write_vio);
++}
++
++static void
++http2_show_data_frame(const char *head_str, nghttp2_session * /*session */ , uint8_t flags,
++                      int32_t stream_id, int32_t length, void *user_data)
++{
++  if (!is_debug_tag_set("http2"))
++    return;
++
++  Http2ClientSession *sm = (Http2ClientSession *) user_data;
++
++  Debug("http2", "%s DATA frame (sm_id:%" PRIu64 ", stream_id:%d, flag:%d, length:%d)\n",
++        head_str, sm->sm_id, stream_id, flags, length);
++}
++
++static void
++http2_show_ctl_frame(const char *head_str, nghttp2_session * /*session */ , nghttp2_frame_type type,
++                     const nghttp2_frame * frame, void *user_data)
++{
++  if (!is_debug_tag_set("http2"))
++    return;
++
++  Http2ClientSession *sm = (Http2ClientSession *) user_data;
++  switch (type) {
++  case NGHTTP2_WINDOW_UPDATE:{
++      nghttp2_window_update *f = (nghttp2_window_update *) frame;
++      Debug("http2", "%s WINDOW_UPDATE (sm_id:%" PRIu64 ", stream_id:%d, flag:%d, delta_window_size:%d)\n",
++            head_str, sm->sm_id, f->hd.stream_id, f->hd.flags, f->window_size_increment);
++    }
++    break;
++  case NGHTTP2_SETTINGS:{
++      nghttp2_settings *f = (nghttp2_settings *) frame;
++      Debug("http2", "%s SETTINGS frame (sm_id:%" PRIu64 ", flag:%d, length:%zd, niv:%zu)\n",
++            head_str, sm->sm_id, f->hd.flags, f->hd.length, f->niv);
++      for (size_t i = 0; i < f->niv; i++) {
++        Debug("http2", "    (%d:%d)\n", f->iv[i].settings_id, f->iv[i].value);
++      }
++    }
++    break;
++  case NGHTTP2_HEADERS:{
++      nghttp2_headers *f = (nghttp2_headers *) frame;
++      Debug("http2", "%s HEADERS frame (sm_id:%" PRIu64 ", stream_id:%d, flag:%d, length:%zd)\n",
++            head_str, sm->sm_id, f->hd.stream_id, f->hd.flags, f->hd.length);
++    }
++    break;
++  case NGHTTP2_RST_STREAM:{
++      nghttp2_rst_stream *f = (nghttp2_rst_stream *) frame;
++      Debug("http2", "%s RST_STREAM (sm_id:%" PRIu64 ", stream_id:%d, flag:%d, length:%zd, code:%d)\n",
++            head_str, sm->sm_id, f->hd.stream_id, f->hd.flags, f->hd.length, f->error_code);
++    }
++    break;
++  case NGHTTP2_GOAWAY:{
++      nghttp2_goaway *f = (nghttp2_goaway *) frame;
++      Debug("http2", "%s GOAWAY frame (sm_id:%" PRIu64 ", last_stream_id:%d, flag:%d, length:%zd\n",
++            head_str, sm->sm_id, f->last_stream_id, f->hd.flags, f->hd.length);
++    }
++  default:
++    break;
++  }
++  return;
++}
++
++static int
++http2_fetcher_launch(Http2Request * req, TSFetchMethod method)
++{
++  string url;
++  int fetch_flags;
++  const sockaddr *client_addr;
++  Http2ClientSession *sm = req->http2_sm;
++
++  url = req->scheme + "://" + req->host + req->path;
++  client_addr = TSNetVConnRemoteAddrGet(reinterpret_cast<TSVConn>(sm->vc));
++
++  req->url = url;
++  Debug("http2", "++++Request[%" PRIu64 ":%d] %s\n", sm->sm_id, req->stream_id, req->url.c_str());
++
++  //
++  // HTTP content should be dechunked before packed into HTTP2.
++  //
++  fetch_flags = TS_FETCH_FLAGS_DECHUNK;
++  req->fetch_sm = TSFetchCreate((TSCont)sm, method, url.c_str(), req->version.c_str(), client_addr, fetch_flags);
++  TSFetchUserDataSet(req->fetch_sm, req);
++
++  //
++  // Set header list
++  //
++  for (size_t i = 0; i < req->headers.size(); i++) {
++
++    if (*req->headers[i].first.c_str() == ':')
++      continue;
++
++    TSFetchHeaderAdd(req->fetch_sm,
++                     req->headers[i].first.c_str(), req->headers[i].first.size(),
++                     req->headers[i].second.c_str(), req->headers[i].second.size());
++  }
++
++  TSFetchLaunch(req->fetch_sm);
++  return 0;
++}
++
++ssize_t
++http2_send_callback(nghttp2_session * /*session */ , const uint8_t * data, size_t length,
++                    int /*flags */ , void *user_data)
++{
++  Http2ClientSession *sm = (Http2ClientSession *) user_data;
++
++  sm->total_size += length;
++  TSIOBufferWrite(sm->resp_buffer, data, length);
++
++  Debug("http2", "----http2_send_callback, length:%zu\n", length);
++
++  return length;
++}
++
++ssize_t
++http2_recv_callback(nghttp2_session * /*session */ , uint8_t * buf, size_t length,
++                    int /*flags */ , void *user_data)
++{
++  Http2ClientSession *sm = (Http2ClientSession *) user_data;
++
++  int64_t already = 0;
++  TSIOBufferBlock blk = TSIOBufferReaderStart(sm->req_reader);
++
++  while (blk) {
++    int64_t wavail = length - already;
++
++    TSIOBufferBlock next_blk = TSIOBufferBlockNext(blk);
++    int64_t blk_len;
++    const char *start = TSIOBufferBlockReadStart(blk, sm->req_reader, &blk_len);
++
++    int64_t need = std::min(wavail, blk_len);
++
++    memcpy(&buf[already], start, need);
++
++    already += need;
++
++    if (already >= (int64_t) length)
++      break;
++
++    blk = next_blk;
++  }
++
++  TSIOBufferReaderConsume(sm->req_reader, already);
++
++  if (sm->read_vio) {
++    TSVIOReenable(sm->read_vio);
++  }
++
++  if (!already)
++    return NGHTTP2_ERR_WOULDBLOCK;
++
++  return already;
++}
++
++static void
++http2_process_headers_frame_as_request(Http2ClientSession * sm, Http2Request * req)
++{
++  // validate request headers
++  for (size_t i = 0; i < req->headers.size(); ++i) {
++    const std::string & field = req->headers[i].first;
++    const std::string & value = req->headers[i].second;
++
++    if (field == ":path")
++      req->path = value;
++    else if (field == ":method")
++      req->method = value;
++    else if (field == ":scheme")
++      req->scheme = value;
++    else if (field == ":authority")
++      req->host = value;
++  }
++  req->version = "HTTP/2";
++
++  if (!req->path.size() || !req->method.size() || !req->scheme.size()
++      || !req->host.size()) {
++    http2_prepare_status_response(sm, req->stream_id, STATUS_400);
++    return;
++  }
++
++  if (req->method == "GET")
++    http2_fetcher_launch(req, TS_FETCH_METHOD_GET);
++  else if (req->method == "POST")
++    http2_fetcher_launch(req, TS_FETCH_METHOD_POST);
++  else if (req->method == "PURGE")
++    http2_fetcher_launch(req, TS_FETCH_METHOD_PURGE);
++  else if (req->method == "PUT")
++    http2_fetcher_launch(req, TS_FETCH_METHOD_PUT);
++  else if (req->method == "HEAD")
++    http2_fetcher_launch(req, TS_FETCH_METHOD_HEAD);
++  else if (req->method == "CONNECT")
++    http2_fetcher_launch(req, TS_FETCH_METHOD_CONNECT);
++  else if (req->method == "DELETE")
++    http2_fetcher_launch(req, TS_FETCH_METHOD_DELETE);
++  else if (req->method == "OPTIONS")
++    http2_fetcher_launch(req, TS_FETCH_METHOD_OPTIONS);
++  else if (req->method == "TRACE")
++    http2_fetcher_launch(req, TS_FETCH_METHOD_TRACE);
++  else if (req->method == "LAST")
++    http2_fetcher_launch(req, TS_FETCH_METHOD_LAST);
++  else
++    http2_prepare_status_response(sm, req->stream_id, STATUS_405);
++
++}
++
++int
++http2_on_frame_recv_callback(nghttp2_session * session, const nghttp2_frame * frame, void *user_data)
++{
++  Http2Request *req;
++  Http2ClientSession *sm = (Http2ClientSession *) user_data;
++
++  http2_show_ctl_frame("++++RECV", session, (nghttp2_frame_type) frame->hd.type, frame, user_data);
++
++  switch (frame->hd.type) {
++  case NGHTTP2_DATA:
++  case NGHTTP2_HEADERS:
++    if (frame->headers.cat == NGHTTP2_HCAT_REQUEST) {
++      req = sm->req_map[frame->hd.stream_id];
++      http2_process_headers_frame_as_request(sm, req);
++    }
++    break;
++
++  case NGHTTP2_SETTINGS:
++    if (sm->write_vio) TSVIOReenable(sm->write_vio);
++    break;
++
++  case NGHTTP2_WINDOW_UPDATE:
++    TSVIOReenable(sm->write_vio);
++    break;
++
++  default:
++    break;
++  }
++  return 0;
++}
++
++int
++http2_on_invalid_frame_recv_callback(nghttp2_session * /*session */ ,
++                                     const nghttp2_frame * /*frame */ ,
++                                     nghttp2_error_code /*status_code */ ,
++                                     void * /*user_data */ )
++{
++  //TODO
++  return 1;
++}
++
++int
++http2_on_data_chunk_recv_callback(nghttp2_session * /*session */ , uint8_t /*flags */ ,
++                                  int32_t stream_id, const uint8_t * data, size_t len, void *user_data)
++{
++  Http2ClientSession *sm = (Http2ClientSession *) user_data;
++  Http2Request *req = sm->req_map[stream_id];
++
++  //
++  // Http2Request has been deleted on error, drop this data;
++  //
++  if (!req)
++    return 1;
++
++  Debug("http2", "++++Fetcher Append Data, len:%zu\n", len);
++  TSFetchWriteData(req->fetch_sm, data, len);
++
++  return 0;
++}
++
++void
++http2_on_data_recv_callback(nghttp2_session * session, uint8_t flags,
++                            int32_t stream_id, int32_t length, void *user_data)
++{
++  Http2ClientSession *sm = (Http2ClientSession *) user_data;
++  Http2Request *req = sm->req_map[stream_id];
++
++  http2_show_data_frame("++++RECV", session, flags, stream_id, length, user_data);
++
++  //
++  // After Http2Request has been deleted on error, the corresponding
++  // client might continue to send POST data, We should reenable
++  // sm->write_vio so that WINDOW_UPDATE has a chance to be sent.
++  //
++  if (!req) {
++    TSVIOReenable(sm->write_vio);
++    return;
++  }
++
++  req->delta_window_size += length;
++
++  Debug("http2", "----sm_id:%" PRId64 ", stream_id:%d, delta_window_size:%d\n",
++        sm->sm_id, stream_id, req->delta_window_size);
++
++  if (req->delta_window_size >= HTTP2_CFG.http2.initial_window_size / 2) {
++    Debug("http2", "----Reenable write_vio for WINDOW_UPDATE frame, delta_window_size:%d\n", req->delta_window_size);
++
++    //
++    // Need not to send WINDOW_UPDATE frame here, what we should
++    // do is to reenable sm->write_vio, and than nghttp2_session_send()
++    // will be triggered and it'll send WINDOW_UPDATE frame automatically.
++    //
++    TSVIOReenable(sm->write_vio);
++
++    req->delta_window_size = 0;
++  }
++
++  return;
++}
++
++int
++http2_before_frame_send_callback(nghttp2_session * /*session */ ,
++                                 const nghttp2_frame * /*frame */ ,
++                                 void * /*user_data */ )
++{
++  //TODO
++  return 0;
++}
++
++int
++http2_on_frame_send_callback(nghttp2_session * session, const nghttp2_frame * frame, void *user_data)
++{
++  http2_show_ctl_frame("----SEND", session, (nghttp2_frame_type) (frame->hd.type), frame, user_data);
++
++  return 0;
++}
++
++int
++http2_on_frame_not_send_callback(nghttp2_session * /*session */ ,
++                                 const nghttp2_frame * /*frame */ ,
++                                 int /*error_code */ ,
++                                 void * /*user_data */ )
++{
++  //TODO
++  return 0;
++}
++
++void
++http2_on_data_send_callback(nghttp2_session * session, uint8_t flags,
++                            int32_t stream_id, int32_t length, void *user_data)
++{
++  Http2ClientSession *sm = (Http2ClientSession *) user_data;
++
++  http2_show_data_frame("----SEND", session, flags, stream_id, length, user_data);
++
++  TSVIOReenable(sm->read_vio);
++  return;
++}
++
++int
++http2_on_stream_close_callback(nghttp2_session * /*session */ ,
++                               int32_t /*stream_id */ ,
++                               nghttp2_error_code /*status_code */ ,
++                               void * /*user_data */ )
++{
++  //TODO
++  return 0;
++}
++
++int
++http2_on_unknown_frame_recv_callback(nghttp2_session * /*session */ ,
++                                     const uint8_t * /*head */ ,
++                                     size_t /*headlen */ ,
++                                     const uint8_t * /*payload */ ,
++                                     size_t /*payloadlen */ ,
++                                     void * /*user_data */ )
++{
++  //TODO
++  return 1;
++}
++
++int
++http2_on_begin_headers_callback(nghttp2_session * /*session */ ,
++                                const nghttp2_frame * frame, void *user_data)
++{
++  Http2Request *req;
++  Http2ClientSession *sm = (Http2ClientSession *) user_data;
++
++  if (frame->hd.type == NGHTTP2_HEADERS && 
++      frame->headers.cat == NGHTTP2_HCAT_REQUEST) {
++    req = http2RequestAllocator.alloc();
++    req->init(sm, frame->hd.stream_id);
++    sm->req_map[frame->hd.stream_id] = req;
++  }
++  return 0;
++}
++
++int
++http2_on_header_callback(nghttp2_session * /*session */ ,
++                         const nghttp2_frame * frame,
++                         const uint8_t * name, size_t namelen, const uint8_t * value, size_t valuelen, uint8_t /*flags*/ , void *user_data)
++{
++  int stream_id = frame->hd.stream_id;
++  Http2ClientSession *sm = (Http2ClientSession *) user_data;
++  std::string n((char *) name, namelen);
++  std::string v((char *) value, valuelen);
++
++  sm->req_map[stream_id]->headers.push_back(make_pair(n, v));
++  return 0;
++}
++
++ssize_t
++http2_select_padding_callback(nghttp2_session * /*session */ ,
++                              const nghttp2_frame * frame, size_t /*max_payloadlen */ ,
++                              void * /*user_data */ )
++{
++  // Don't insert padding
++  return frame->hd.length;
++}
+diff --git a/proxy/http2/Http2Callbacks.h b/proxy/http2/Http2Callbacks.h
+new file mode 100644
+index 0000000..e14e529
+--- /dev/null
++++ b/proxy/http2/Http2Callbacks.h
+@@ -0,0 +1,261 @@
++/** @file
++
++  Http2Callbacks.h
++
++  @section license License
++
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#ifndef __P_HTTP2_CALLBACKS_H__
++#define __P_HTTP2_CALLBACKS_H__
++
++#include <nghttp2/nghttp2.h>
++class Http2ClientSession;
++
++void http2_callbacks_init(nghttp2_session_callbacks * callbacks);
++void http2_prepare_status_response(Http2ClientSession * sm, int stream_id, const char *status);
++
++/**
++ * @functypedef
++ *
++ * Callback function invoked when |session| wants to send data to the
++ * remote peer. The implementation of this function must send at most
++ * |length| bytes of data stored in |data|. The |flags| is currently
++ * not used and always 0. It must return the number of bytes sent if
++ * it succeeds.  If it cannot send any single byte without blocking,
++ * it must return :enum:`NGHTTP2_ERR_WOULDBLOCK`. For other errors, it
++ * must return :enum:`NGHTTP2_ERR_CALLBACK_FAILURE`.
++ */
++ssize_t http2_send_callback(nghttp2_session * session, const uint8_t * data, size_t length, int flags, void *user_data);
++
++/**
++ * @functypedef
++ *
++ * Callback function invoked when |session| wants to receive data from
++ * the remote peer. The implementation of this function must read at
++ * most |length| bytes of data and store it in |buf|. The |flags| is
++ * currently not used and always 0. It must return the number of bytes
++ * written in |buf| if it succeeds. If it cannot read any single byte
++ * without blocking, it must return :enum:`NGHTTP2_ERR_WOULDBLOCK`. If
++ * it gets EOF before it reads any single byte, it must return
++ * :enum:`NGHTTP2_ERR_EOF`. For other errors, it must return
++ * :enum:`NGHTTP2_ERR_CALLBACK_FAILURE`.
++ */
++ssize_t http2_recv_callback(nghttp2_session * session, uint8_t * buf, size_t length, int flags, void *user_data);
++
++/**
++ * @functypedef
++ *
++ * Callback function invoked by `nghttp2_session_recv()` when a
++ * control frame is received.
++ */
++int http2_on_frame_recv_callback(nghttp2_session * session, const nghttp2_frame * frame, void *user_data);
++
++/**
++ * @functypedef
++ *
++ * Callback function invoked by `nghttp2_session_recv()` when an
++ * invalid control frame is received. The |status_code| is one of the
++ * :enum:`nghttp2_status_code` and indicates the error. When this
++ * callback function is invoked, the library automatically submits
++ * either RST_STREAM or GOAWAY frame.
++ */
++int http2_on_invalid_frame_recv_callback
++  (nghttp2_session * session, const nghttp2_frame * frame, nghttp2_error_code status_code, void *user_data);
++
++/**
++ * @functypedef
++ *
++ * Callback function invoked when a chunk of data in DATA frame is
++ * received. The |stream_id| is the stream ID this DATA frame belongs
++ * to. The |flags| is the flags of DATA frame which this data chunk is
++ * contained. ``(flags & NGHTTP2_DATA_FLAG_FIN) != 0`` does not
++ * necessarily mean this chunk of data is the last one in the
++ * stream. You should use :type:`nghttp2_on_data_recv_callback` to
++ * know all data frames are received.
++ */
++int http2_on_data_chunk_recv_callback
++  (nghttp2_session * session, uint8_t flags, int32_t stream_id, const uint8_t * data, size_t len, void *user_data);
++
++/**
++ * @functypedef
++ *
++ * Callback function invoked when DATA frame is received. The actual
++ * data it contains are received by
++ * :type:`nghttp2_on_data_chunk_recv_callback`.
++ */
++void http2_on_data_recv_callback
++  (nghttp2_session * session, uint8_t flags, int32_t stream_id, int32_t length, void *user_data);
++
++/**
++ * @functypedef
++ *
++ * Callback function invoked before the control frame |frame| of type
++ * |type| is sent. This may be useful, for example, to know the stream
++ * ID of SYN_STREAM frame (see also
++ * `nghttp2_session_get_stream_user_data()`), which is not assigned
++ * when it was queued.
++ */
++int http2_before_frame_send_callback(nghttp2_session * session, const nghttp2_frame * frame, void *user_data);
++
++/**
++ * @functypedef
++ *
++ * Callback function invoked after the control frame |frame| of type
++ * |type| is sent.
++ */
++int http2_on_frame_send_callback(nghttp2_session * session, const nghttp2_frame * frame, void *user_data);
++
++/**
++ * @functypedef
++ *
++ * Callback function invoked after the control frame |frame| of type
++ * |type| is not sent because of the error. The error is indicated by
++ * the |error_code|, which is one of the values defined in
++ * :type:`nghttp2_error`.
++ */
++int http2_on_frame_not_send_callback
++  (nghttp2_session * session, const nghttp2_frame * frame, int error_code, void *user_data);
++
++/**
++ * @functypedef
++ *
++ * Callback function invoked after DATA frame is sent.
++ */
++void http2_on_data_send_callback
++  (nghttp2_session * session, uint8_t flags, int32_t stream_id, int32_t length, void *user_data);
++
++/**
++ * @functypedef
++ *
++ * Callback function invoked when the stream |stream_id| is
++ * closed. The reason of closure is indicated by the
++ * |status_code|. The stream_user_data, which was specified in
++ * `nghttp2_submit_request()` or `nghttp2_submit_syn_stream()`, is
++ * still available in this function.
++ */
++int http2_on_stream_close_callback
++  (nghttp2_session * session, int32_t stream_id, nghttp2_error_code status_code, void *user_data);
++
++/**
++ * @functypedef
++ *
++ * Callback function invoked when the library needs the cryptographic
++ * proof that the client has possession of the private key associated
++ * with the certificate for the given |origin|.  If called with
++ * |prooflen| == 0, the implementation of this function must return
++ * the length of the proof in bytes. If called with |prooflen| > 0,
++ * write proof into |proof| exactly |prooflen| bytes and return 0.
++ *
++ * Because the client certificate vector has limited number of slots,
++ * the application code may be required to pass the same proof more
++ * than once.
++
++ssize_t http2_get_credential_proof
++(nghttp2_session *session, const nghttp2_origin *origin,
++ uint8_t *proof, size_t prooflen, void *user_data);
++ */
++
++/**
++ * @functypedef
++ *
++ * Callback function invoked when the library needs the length of the
++ * client certificate chain for the given |origin|.  The
++ * implementation of this function must return the length of the
++ * client certificate chain.  If no client certificate is required for
++ * the given |origin|, return 0.  If positive integer is returned,
++ * :type:`nghttp2_get_credential_proof` and
++ * :type:`nghttp2_get_credential_cert` callback functions will be used
++ * to get the cryptographic proof and certificate respectively.
++
++ssize_t http2_get_credential_ncerts
++(nghttp2_session *session, const nghttp2_origin *origin, void *user_data);
++ */
++
++/**
++ * @functypedef
++ *
++ * Callback function invoked when the library needs the client
++ * certificate for the given |origin|. The |idx| is the index of the
++ * certificate chain and 0 means the leaf certificate of the chain.
++ * If called with |certlen| == 0, the implementation of this function
++ * must return the length of the certificate in bytes. If called with
++ * |certlen| > 0, write certificate into |cert| exactly |certlen|
++ * bytes and return 0.
++
++ssize_t http2_get_credential_cert
++(nghttp2_session *session, const nghttp2_origin *origin, size_t idx,
++ uint8_t *cert, size_t certlen, void *user_data);
++ */
++
++/**
++ * @functypedef
++ *
++ * Callback function invoked when the request from the remote peer is
++ * received.  In other words, the frame with FIN flag set is received.
++ * In HTTP, this means HTTP request, including request body, is fully
++ * received.
++ */
++void http2_on_request_recv_callback(nghttp2_session * session, int32_t stream_id, void *user_data);
++
++/**
++ * @functypedef
++ *
++ * Callback function invoked when the received control frame octets
++ * could not be parsed correctly. The |type| indicates the type of
++ * received control frame. The |head| is the pointer to the header of
++ * the received frame. The |headlen| is the length of the
++ * |head|. According to the HTTP2 spec, the |headlen| is always 8. In
++ * other words, the |head| is the first 8 bytes of the received frame.
++ * The |payload| is the pointer to the data portion of the received
++ * frame.  The |payloadlen| is the length of the |payload|. This is
++ * the data after the length field. The |error_code| is one of the
++ * error code defined in :enum:`nghttp2_error` and indicates the
++ * error.
++ */
++void http2_on_ctrl_recv_parse_error_callback
++  (nghttp2_session * session, nghttp2_frame_type type,
++   const uint8_t * head, size_t headlen, const uint8_t * payload, size_t payloadlen, int error_code, void *user_data);
++
++/**
++ * @functypedef
++ *
++ * Callback function invoked when the received control frame type is
++ * unknown. The |head| is the pointer to the header of the received
++ * frame. The |headlen| is the length of the |head|. According to the
++ * HTTP2 spec, the |headlen| is always 8. In other words, the |head| is
++ * the first 8 bytes of the received frame.  The |payload| is the
++ * pointer to the data portion of the received frame.  The
++ * |payloadlen| is the length of the |payload|. This is the data after
++ * the length field.
++ */
++int http2_on_unknown_frame_recv_callback
++  (nghttp2_session * session,
++   const uint8_t * head, size_t headlen, const uint8_t * payload, size_t payloadlen, void *user_data);
++
++int http2_on_begin_headers_callback(nghttp2_session * session, const nghttp2_frame * frame, void *user_data);
++
++int http2_on_header_callback
++  (nghttp2_session * session,
++   const nghttp2_frame * frame,
++   const uint8_t * name, size_t namelen, const uint8_t * value, size_t valuelen, uint8_t flags, void *user_data);
++
++ssize_t http2_select_padding_callback
++  (nghttp2_session * session, const nghttp2_frame * frame, size_t max_payloadlen, void *user_data);
++
++#endif
+diff --git a/proxy/http2/Http2ClientSession.cc b/proxy/http2/Http2ClientSession.cc
+new file mode 100644
+index 0000000..cc8e48b
+--- /dev/null
++++ b/proxy/http2/Http2ClientSession.cc
+@@ -0,0 +1,400 @@
++/** @file
++
++  Http2ClientSession.cc
++
++  @section license License
++
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#include "Http2ClientSession.h"
++#include "I_Net.h"
++
++static ClassAllocator < Http2ClientSession > http2ClientSessionAllocator("Http2ClientSessionAllocator");
++ClassAllocator < Http2Request > http2RequestAllocator("Http2RequestAllocator");
++
++static int http2_process_read(TSEvent event, Http2ClientSession * sm);
++static int http2_process_write(TSEvent event, Http2ClientSession * sm);
++static int http2_process_fetch(TSEvent event, Http2ClientSession * sm, void *edata);
++static int http2_process_fetch_header(TSEvent event, Http2ClientSession * sm, TSFetchSM fetch_sm);
++static int http2_process_fetch_body(TSEvent event, Http2ClientSession * sm, TSFetchSM fetch_sm);
++static int http2_skip_client_connection_preface(TSIOBufferReader req_reader);
++static uint64_t g_sm_id;
++static uint64_t g_sm_cnt;
++
++void
++Http2Request::clear()
++{
++  if (fetch_sm)
++    TSFetchDestroy(fetch_sm);
++
++  vector<pair<string, string> >().swap(headers);
++
++  std::string().swap(url);
++  std::string().swap(host);
++  std::string().swap(path);
++  std::string().swap(scheme);
++  std::string().swap(method);
++  std::string().swap(version);
++
++  Debug("http2", "****Delete Request[%" PRIu64 ":%d]\n", http2_sm->sm_id, stream_id);
++}
++
++void
++Http2ClientSession::init(NetVConnection * netvc)
++{
++  atomic_inc(g_sm_cnt);
++
++  this->mutex = new_ProxyMutex();
++  this->vc = netvc;
++  this->req_map.clear();
++
++  int r = nghttp2_session_server_new(&session, &HTTP2_CFG.http2.callbacks, this);
++
++  ink_release_assert(r == 0);
++  sm_id = atomic_inc(g_sm_id);
++  total_size = 0;
++  start_time = TShrtime();
++
++  this->vc->set_inactivity_timeout(HRTIME_SECONDS(HTTP2_CFG.accept_no_activity_timeout));
++  SET_HANDLER(&Http2ClientSession::state_session_start);
++}
++
++void
++Http2ClientSession::clear()
++{
++  uint64_t nr_pending;
++  int last_event = event;
++  //
++  // Http2Request depends on Http2ClientSession,
++  // we should delete it firstly to avoid race.
++  //
++  map < int, Http2Request * >::iterator iter = req_map.begin();
++  map < int, Http2Request * >::iterator endIter = req_map.end();
++  for (; iter != endIter; ++iter) {
++    Http2Request *req = iter->second;
++    req->clear();
++    http2RequestAllocator.free(req);
++  }
++  req_map.clear();
++
++  this->mutex = NULL;
++
++  if (vc) {
++    TSVConnClose(reinterpret_cast<TSVConn>(vc));
++    vc = NULL;
++  }
++
++  if (req_reader) {
++    TSIOBufferReaderFree(req_reader);
++    req_reader = NULL;
++  }
++
++  if (req_buffer) {
++    TSIOBufferDestroy(req_buffer);
++    req_buffer = NULL;
++  }
++
++  if (resp_reader) {
++    TSIOBufferReaderFree(resp_reader);
++    resp_reader = NULL;
++  }
++
++  if (resp_buffer) {
++    TSIOBufferDestroy(resp_buffer);
++    resp_buffer = NULL;
++  }
++
++  if (session) {
++    nghttp2_session_del(session);
++    session = NULL;
++  }
++
++  nr_pending = atomic_dec(g_sm_cnt);
++  Debug("http2-free", "****Delete Http2ClientSession[%" PRIu64 "], last event:%d, nr_pending:%" PRIu64 "\n",
++        sm_id, last_event, --nr_pending);
++}
++
++void
++http2_sm_create(NetVConnection * netvc, MIOBuffer * iobuf, IOBufferReader * reader)
++{
++  Http2ClientSession *sm;
++
++  sm = http2ClientSessionAllocator.alloc();
++  sm->init(netvc);
++
++  sm->req_buffer = iobuf ? reinterpret_cast<TSIOBuffer>(iobuf) : TSIOBufferCreate();
++  sm->req_reader = reader ? reinterpret_cast<TSIOBufferReader>(reader) : TSIOBufferReaderAlloc(sm->req_buffer);
++
++  sm->resp_buffer = TSIOBufferCreate();
++  sm->resp_reader = TSIOBufferReaderAlloc(sm->resp_buffer);
++
++  eventProcessor.schedule_imm(sm, ET_NET);
++}
++
++int
++Http2ClientSession::state_session_start(int /* event */ , void * /* edata */ )
++{
++  if (TSIOBufferReaderAvail(this->req_reader) > 0) {
++    http2_process_read(TS_EVENT_VCONN_WRITE_READY, this);
++  }
++
++  this->read_vio = (TSVIO)this->vc->do_io_read(this, INT64_MAX, reinterpret_cast<MIOBuffer *>(this->req_buffer));
++  this->write_vio = (TSVIO)this->vc->do_io_write(this, INT64_MAX, reinterpret_cast<IOBufferReader *>(this->resp_reader));
++
++  SET_HANDLER(&Http2ClientSession::state_session_readwrite);
++
++  TSVIOReenable(this->read_vio);
++  return EVENT_CONT;
++}
++
++int
++Http2ClientSession::state_session_readwrite(int event, void * edata)
++{
++  int ret = 0;
++  bool from_fetch = false;
++ 
++  this->event = event;
++
++  if (edata == this->read_vio) {
++    Debug("http2", "++++[READ EVENT]\n");
++    if (event != TS_EVENT_VCONN_READ_READY && event != TS_EVENT_VCONN_READ_COMPLETE) {
++      ret = -1;
++      goto out;
++    }
++    ret = http2_process_read((TSEvent)event, this);
++  } else if (edata == this->write_vio) {
++    Debug("http2", "----[WRITE EVENT]\n");
++    if (event != TS_EVENT_VCONN_WRITE_READY && event != TS_EVENT_VCONN_WRITE_COMPLETE) {
++      ret = -1;
++      goto out;
++    }
++    ret = http2_process_write((TSEvent)event, this);
++  } else {
++    from_fetch = true;
++    ret = http2_process_fetch((TSEvent)event, this, edata);
++  }
++
++  Debug("http2-event", "++++Http2ClientSession[%" PRIu64 "], EVENT:%d, ret:%d, nr_pending:%" PRIu64 "\n",
++        this->sm_id, event, ret, g_sm_cnt);
++out:
++  if (ret) {
++    this->clear();
++    http2ClientSessionAllocator.free(this);
++  } else if (!from_fetch) {
++    this->vc->set_inactivity_timeout(HRTIME_SECONDS(HTTP2_CFG.no_activity_timeout_in));
++  }
++
++  return EVENT_CONT;
++}
++
++static int
++http2_process_read(TSEvent /* event ATS_UNUSED */ , Http2ClientSession * sm)
++{
++  http2_skip_client_connection_preface(sm->req_reader);
++  return nghttp2_session_recv(sm->session);
++}
++
++static int
++http2_process_write(TSEvent /* event ATS_UNUSED */ , Http2ClientSession * sm)
++{
++  int ret;
++
++  ret = nghttp2_session_send(sm->session);
++
++  if (TSIOBufferReaderAvail(sm->resp_reader) > 0)
++    TSVIOReenable(sm->write_vio);
++  else {
++    Debug("http2", "----TOTAL SEND (sm_id:%" PRIu64 ", total_size:%" PRIu64 ", total_send:%" PRId64 ")\n",
++          sm->sm_id, sm->total_size, TSVIONDoneGet(sm->write_vio));
++
++    //
++    // We should reenable read_vio when no data to be written,
++    // otherwise it could lead to hang issue when client POST
++    // data is waiting to be read.
++    //
++    TSVIOReenable(sm->read_vio);
++  }
++
++  return ret;
++}
++
++static int
++http2_process_fetch(TSEvent event, Http2ClientSession * sm, void *edata)
++{
++  int ret = -1;
++  TSFetchSM fetch_sm = (TSFetchSM) edata;
++  Http2Request *req = (Http2Request *) TSFetchUserDataGet(fetch_sm);
++
++  switch ((int) event) {
++
++  case TS_FETCH_EVENT_EXT_HEAD_DONE:
++    Debug("http2", "----[FETCH HEADER DONE]\n");
++    ret = http2_process_fetch_header(event, sm, fetch_sm);
++    break;
++
++  case TS_FETCH_EVENT_EXT_BODY_READY:
++    Debug("http2", "----[FETCH BODY READY]\n");
++    ret = http2_process_fetch_body(event, sm, fetch_sm);
++    break;
++
++  case TS_FETCH_EVENT_EXT_BODY_DONE:
++    Debug("http2", "----[FETCH BODY DONE]\n");
++    req->fetch_body_completed = true;
++    ret = http2_process_fetch_body(event, sm, fetch_sm);
++    break;
++
++  default:
++    Debug("http2", "----[FETCH ERROR]\n");
++    if (req->fetch_body_completed)
++      ret = 0;                  // Ignore fetch errors after FETCH BODY DONE
++    else
++      req->fetch_sm = NULL;
++    break;
++  }
++
++  if (ret) {
++    http2_prepare_status_response(sm, req->stream_id, STATUS_500);
++    sm->req_map.erase(req->stream_id);
++    req->clear();
++    http2RequestAllocator.free(req);
++  }
++
++  return 0;
++}
++
++static int
++http2_process_fetch_header(TSEvent /*event */ , Http2ClientSession * sm, TSFetchSM fetch_sm)
++{
++  int ret;
++  Http2Request *req = (Http2Request *) TSFetchUserDataGet(fetch_sm);
++  Http2NV http2_nv(fetch_sm);
++
++  Debug("http2", "----nghttp2_submit_headers\n");
++  ret = nghttp2_submit_headers(sm->session, NGHTTP2_FLAG_NONE,
++                               req->stream_id, 0,
++                               (const nghttp2_nv *) http2_nv.nv().data(), http2_nv.nv().size(), NULL);
++
++  TSVIOReenable(sm->write_vio);
++  return ret;
++}
++
++static ssize_t
++http2_read_fetch_body_callback(nghttp2_session * /*session */ , int32_t stream_id,
++                               uint8_t * buf, size_t length, uint32_t *eof, nghttp2_data_source * source, void *user_data)
++{
++
++  static int g_call_cnt;
++  int64_t already;
++
++  Http2ClientSession *sm = (Http2ClientSession *) user_data;
++  Http2Request *req = (Http2Request *) source->ptr;
++
++  //
++  // req has been deleted, ignore this data.
++  //
++  if (req != sm->req_map[stream_id]) {
++    Debug("http2", "    stream_id:%d, call:%d, req has been deleted, return 0\n", stream_id, g_call_cnt);
++    *eof = 1;
++    return 0;
++  }
++
++  already = TSFetchReadData(req->fetch_sm, buf, length);
++
++  Debug("http2", "    stream_id:%d, call:%d, length:%ld, already:%ld\n", stream_id, g_call_cnt, length, already);
++  if (HTTP2_CFG.http2.verbose)
++    MD5_Update(&req->recv_md5, buf, already);
++
++  TSVIOReenable(sm->write_vio);
++  g_call_cnt++;
++
++  req->fetch_data_len += already;
++  if (already < (int64_t) length) {
++    if (req->event == TS_FETCH_EVENT_EXT_BODY_DONE) {
++      TSHRTime end_time = TShrtime();
++      Debug("http2", "----Request[%" PRIu64 ":%d] %s %lld %d\n", sm->sm_id, req->stream_id,
++            req->url.c_str(), (end_time - req->start_time) / TS_HRTIME_MSECOND, req->fetch_data_len);
++      unsigned char digest[MD5_DIGEST_LENGTH];
++      if (HTTP2_CFG.http2.verbose) {
++        MD5_Final(digest, &req->recv_md5);
++        Debug("http2", "----recv md5sum: ");
++        for (int i = 0; i < MD5_DIGEST_LENGTH; i++) {
++          Debug("http2", "%02x", digest[i]);
++        }
++        Debug("http2", "\n");
++      }
++      *eof = 1;
++      sm->req_map.erase(stream_id);
++      req->clear();
++      http2RequestAllocator.free(req);
++    } else if (already == 0) {
++      req->need_resume_data = true;
++      return NGHTTP2_ERR_DEFERRED;
++    }
++  }
++
++  return already;
++}
++
++static int
++http2_process_fetch_body(TSEvent event, Http2ClientSession * sm, TSFetchSM fetch_sm)
++{
++  int ret = 0;
++  nghttp2_data_provider data_prd;
++  Http2Request *req = (Http2Request *) TSFetchUserDataGet(fetch_sm);
++  req->event = event;
++
++  data_prd.source.ptr = (void *) req;
++  data_prd.read_callback = http2_read_fetch_body_callback;
++
++  if (!req->has_submitted_data) {
++    req->has_submitted_data = true;
++    Debug("http2", "----nghttp2_submit_data\n");
++    ret = nghttp2_submit_data(sm->session, NGHTTP2_FLAG_END_STREAM, req->stream_id, &data_prd);
++  } else if (req->need_resume_data) {
++    Debug("http2", "----nghttp2_session_resume_data\n");
++    ret = nghttp2_session_resume_data(sm->session, req->stream_id);
++    if (ret == NGHTTP2_ERR_INVALID_ARGUMENT)
++      ret = 0;
++  }
++
++  TSVIOReenable(sm->write_vio);
++  return ret;
++}
++
++static int
++http2_skip_client_connection_preface(TSIOBufferReader req_reader)
++{
++  const char *start;
++  TSIOBufferBlock blk;
++  int64_t blk_len;
++
++  blk = TSIOBufferReaderStart(req_reader);
++  if (!blk)
++    return 0;
++  start = TSIOBufferBlockReadStart(blk, req_reader, &blk_len);
++
++  if (blk_len >= NGHTTP2_CLIENT_CONNECTION_PREFACE_LEN) {
++    std::string ccheader(start, NGHTTP2_CLIENT_CONNECTION_PREFACE_LEN);
++
++    if (ccheader == NGHTTP2_CLIENT_CONNECTION_PREFACE) {
++      // Consume client connection preface
++      TSIOBufferReaderConsume(req_reader, NGHTTP2_CLIENT_CONNECTION_PREFACE_LEN);
++    }
++  }
++  return 0;
++}
+diff --git a/proxy/http2/Http2ClientSession.h b/proxy/http2/Http2ClientSession.h
+new file mode 100644
+index 0000000..de8d77f
+--- /dev/null
++++ b/proxy/http2/Http2ClientSession.h
+@@ -0,0 +1,142 @@
++/** @file
++
++  Http2ClientSession.h
++
++  @section license License
++
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#ifndef __P_HTTP2_SM_H__
++#define __P_HTTP2_SM_H__
++
++#include "Http2Common.h"
++#include "Http2Callbacks.h"
++#include <openssl/md5.h>
++
++class Http2ClientSession;
++typedef int (*Http2ClientSessionHandler) (TSCont contp, TSEvent event, void *data);
++
++class Http2Request
++{
++public:
++  Http2Request():http2_sm(NULL), stream_id(-1), fetch_sm(NULL),
++    has_submitted_data(false), need_resume_data(false),
++    fetch_data_len(0), delta_window_size(0), fetch_body_completed(false)
++  {
++  }
++
++  Http2Request(Http2ClientSession * sm, int id):http2_sm(NULL), stream_id(-1), fetch_sm(NULL),
++    has_submitted_data(false), need_resume_data(false),
++    fetch_data_len(0), delta_window_size(0), fetch_body_completed(false)
++  {
++    init(sm, id);
++  }
++
++  ~Http2Request() {
++    clear();
++  }
++
++  void init(Http2ClientSession * sm, int id)
++  {
++    http2_sm = sm;
++    stream_id = id;
++    headers.clear();
++
++    MD5_Init(&recv_md5);
++    start_time = TShrtime();
++  }
++
++  void clear();
++
++  void append_nv(char **nv)
++  {
++    for (int i = 0; nv[i]; i += 2) {
++      headers.push_back(make_pair(nv[i], nv[i + 1]));
++    }
++  }
++
++public:
++  int event;
++  Http2ClientSession *http2_sm;
++  int stream_id;
++  TSHRTime start_time;
++  TSFetchSM fetch_sm;
++  bool has_submitted_data;
++  bool need_resume_data;
++  int fetch_data_len;
++  int delta_window_size;
++  bool fetch_body_completed;
++  vector < pair < string, string > >headers;
++
++  string url;
++  string host;
++  string path;
++  string scheme;
++  string method;
++  string version;
++
++  MD5_CTX recv_md5;
++};
++
++class Http2ClientSession : public Continuation
++{
++
++public:
++
++  Http2ClientSession() : Continuation(NULL) {
++  }
++
++  ~Http2ClientSession() {
++    clear();
++  }
++
++  void init(NetVConnection * netvc);
++  void clear();
++
++public:
++
++  int64_t sm_id;
++  uint64_t total_size;
++  TSHRTime start_time;
++
++  NetVConnection * vc;
++
++  TSIOBuffer req_buffer;
++  TSIOBufferReader req_reader;
++
++  TSIOBuffer resp_buffer;
++  TSIOBufferReader resp_reader;
++
++  TSVIO read_vio;
++  TSVIO write_vio;
++
++  int event;
++  nghttp2_session *session;
++
++  map < int32_t, Http2Request * >req_map;
++
++private:
++  int state_session_start(int event, void * edata);
++  int state_session_readwrite(int event, void * edata);
++};
++
++void http2_sm_create(NetVConnection * netvc, MIOBuffer * iobuf, IOBufferReader * reader);
++
++extern ClassAllocator < Http2Request > http2RequestAllocator;
++
++#endif
+diff --git a/proxy/http2/Http2Common.cc b/proxy/http2/Http2Common.cc
+new file mode 100644
+index 0000000..835ac77
+--- /dev/null
++++ b/proxy/http2/Http2Common.cc
+@@ -0,0 +1,114 @@
++/** @file
++
++  Http2Common.cc
++
++  @section license License
++
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#include "Http2Common.h"
++#include "Http2Callbacks.h"
++
++#include <sstream>
++
++Config HTTP2_CFG;
++
++int
++http2_config_load()
++{
++  HTTP2_CFG.nr_accept_threads = 1;
++  HTTP2_CFG.accept_no_activity_timeout = 30;
++  HTTP2_CFG.no_activity_timeout_in = 30;
++  HTTP2_CFG.http2.verbose = false;
++  HTTP2_CFG.http2.enable_tls = false;
++  HTTP2_CFG.http2.keep_host_port = false;
++  //
++  // HTTP2 plugin will share the same port number with
++  // http server, unless '--port' is given.
++  //
++  HTTP2_CFG.http2.serv_port = -1;
++  HTTP2_CFG.http2.max_concurrent_streams = 1000;
++  HTTP2_CFG.http2.initial_window_size = (64 << 10);
++
++  http2_callbacks_init(&HTTP2_CFG.http2.callbacks);
++
++  return 0;
++}
++
++nghttp2_nv
++make_nv_ss(const std::string & name, const std::string & value)
++{
++  return {
++    (uint8_t *) name.c_str(), (uint8_t *) value.c_str(), (uint16_t) name.size(), (uint16_t) value.size()
++  };
++}
++
++Http2NV::Http2NV(TSFetchSM fetch_sm)
++{
++  const char *name, *value;
++  int name_len, value_len;
++  TSMLoc loc, field_loc, next_loc;
++  TSMBuffer bufp;
++
++  bufp = TSFetchRespHdrMBufGet(fetch_sm);
++  loc = TSFetchRespHdrMLocGet(fetch_sm);
++
++  //
++  // Process Status
++  //
++  int status_code = TSHttpHdrStatusGet(bufp, loc);
++  value = (char *) TSHttpHdrReasonGet(bufp, loc, &value_len);
++  std::stringstream ss;
++  ss << status_code  << " " << std::string(value, value_len);
++  status = ss.str();
++  _nv.push_back(make_nv_ls(":status", status));
++
++  //
++  // Process HTTP headers
++  //
++  field_loc = TSMimeHdrFieldGet(bufp, loc, 0);
++  while (field_loc) {
++    name = TSMimeHdrFieldNameGet(bufp, loc, field_loc, &name_len);
++    TSReleaseAssert(name && name_len);
++
++    //
++    // According HTTP2 spec, in RESPONSE:
++    // The Connection, Keep-Alive, Proxy-Connection, and
++    // Transfer-Encoding headers are not valid and MUST not be sent.
++    //
++    if (strncasecmp(name, "Connection", name_len) &&
++        strncasecmp(name, "Keep-Alive", name_len) &&
++        strncasecmp(name, "Proxy-Connection", name_len) && strncasecmp(name, "Transfer-Encoding", name_len)) {
++      value = TSMimeHdrFieldValueStringGet(bufp, loc, field_loc, -1, &value_len);
++
++      // Any HTTP headers with empty value are invalid,
++      // we should ignore them.
++      if (value && value_len) {
++          _nv.push_back((nghttp2_nv) {
++              (uint8_t *) name,
++              (uint8_t *) value,
++              (uint16_t) name_len,
++              (uint16_t) value_len});
++      }
++    }
++
++    next_loc = TSMimeHdrFieldNext(bufp, loc, field_loc);
++    TSHandleMLocRelease(bufp, loc, field_loc);
++    field_loc = next_loc;
++  }
++}
+diff --git a/proxy/http2/Http2Common.h b/proxy/http2/Http2Common.h
+new file mode 100644
+index 0000000..74f5cfb
+--- /dev/null
++++ b/proxy/http2/Http2Common.h
+@@ -0,0 +1,116 @@
++/** @file
++
++  Http2Common.h
++
++  @section license License
++
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#ifndef __P_HTTP2_COMMON_H__
++#define __P_HTTP2_COMMON_H__
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <getopt.h>
++#include <limits.h>
++#include <string.h>
++#include <string>
++#include <vector>
++#include <map>
++
++#include "P_Net.h"
++#include "ts/ts.h"
++#include "ts/libts.h"
++#include "ts/experimental.h"
++#include <nghttp2/nghttp2.h>
++using namespace std;
++
++#define STATUS_200      "200 OK"
++#define STATUS_304      "304 Not Modified"
++#define STATUS_400      "400 Bad Request"
++#define STATUS_404      "404 Not Found"
++#define STATUS_405      "405 Method Not Allowed"
++#define STATUS_500      "500 Internal Server Error"
++#define DEFAULT_HTML    "index.html"
++#define HTTP2D_SERVER    "ATS Nghttp2/" NGHTTP2_VERSION
++
++#define atomic_fetch_and_add(a, b)  __sync_fetch_and_add(&a, b)
++#define atomic_fetch_and_sub(a, b)  __sync_fetch_and_sub(&a, b)
++#define atomic_inc(a)   atomic_fetch_and_add(a, 1)
++#define atomic_dec(a)   atomic_fetch_and_sub(a, 1)
++
++struct Http2Config
++{
++  bool verbose;
++  bool enable_tls;
++  bool keep_host_port;
++  int serv_port;
++  int max_concurrent_streams;
++  int initial_window_size;
++  nghttp2_session_callbacks callbacks;
++};
++
++struct Config
++{
++  Http2Config http2;
++  int nr_accept_threads;
++  int accept_no_activity_timeout;
++  int no_activity_timeout_in;
++};
++
++// Http2 Name/Value pairs
++class Http2NV
++{
++public:
++
++  Http2NV(TSFetchSM fetch_sm);
++
++  std::vector < nghttp2_nv > &nv()
++  {
++    return _nv;
++  }
++
++private:
++
++    Http2NV();
++
++  std::vector < nghttp2_nv > _nv;
++  std::string status;
++};
++
++int http2_config_load();
++
++
++nghttp2_nv make_nv_ss(const std::string & name, const std::string & value);
++template < size_t N > nghttp2_nv make_nv_lc(const char (&name)[N], const char *value)
++{
++  return {
++    (uint8_t *) name, (uint8_t *) value, (uint16_t) (N - 1), (uint16_t) strlen(value)
++  };
++}
++
++template < size_t N > nghttp2_nv make_nv_ls(const char (&name)[N], const std::string & value)
++{
++  return {
++    (uint8_t *) name, (uint8_t *) value.c_str(), (uint16_t) (N - 1), (uint16_t) value.size()
++  };
++}
++
++extern Config HTTP2_CFG;
++#endif
+diff --git a/proxy/http2/Http2SessionAccept.cc b/proxy/http2/Http2SessionAccept.cc
+new file mode 100644
+index 0000000..50603a2
+--- /dev/null
++++ b/proxy/http2/Http2SessionAccept.cc
+@@ -0,0 +1,70 @@
++/** @file
++
++  Http2NetAccept
++
++  @section license License
++
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#include "Http2SessionAccept.h"
++#include "Error.h"
++
++#if TS_HAS_HTTP2
++#include "Http2ClientSession.h"
++#endif
++
++Http2SessionAccept::Http2SessionAccept(Continuation * ep)
++:SessionAccept(new_ProxyMutex()), endpoint(ep)
++{
++#if TS_HAS_HTTP2
++  http2_config_load();
++#endif
++  SET_HANDLER(&Http2SessionAccept::mainEvent);
++}
++
++int
++Http2SessionAccept::mainEvent(int event, void * edata)
++{
++  if (event == NET_EVENT_ACCEPT) {
++    NetVConnection * netvc = static_cast<NetVConnection *>(edata);
++#if TS_HAS_HTTP2
++    http2_sm_create(netvc, NULL, NULL);
++#else
++    Error("accepted a HTTP2 session, but HTTP2 support is not available");
++    netvc->do_io_close();
++#endif
++    return EVENT_CONT;
++  }
++
++  MachineFatal("HTTP2 accept received fatal error: errno = %d", -((int)(intptr_t)edata));
++  return EVENT_CONT;
++}
++
++void
++Http2SessionAccept::accept(NetVConnection * netvc, MIOBuffer * iobuf, IOBufferReader * reader)
++{
++#if TS_HAS_HTTP2
++  http2_sm_create(netvc, iobuf, reader);
++#else
++  (void)netvc;
++  (void)iobuf;
++  (void)reader;
++  ink_release_assert(0);
++#endif
++
++}
+diff --git a/proxy/http2/Http2SessionAccept.h b/proxy/http2/Http2SessionAccept.h
+new file mode 100644
+index 0000000..5c25064
+--- /dev/null
++++ b/proxy/http2/Http2SessionAccept.h
+@@ -0,0 +1,48 @@
++/** @file
++
++  Http2SessionAccept
++
++  @section license License
++
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#ifndef Http2AcceptCont_H_
++#define Http2AcceptCont_H_
++
++#include "P_Net.h"
++#include "P_EventSystem.h"
++#include "P_UnixNet.h"
++#include "I_IOBuffer.h"
++
++class Http2SessionAccept:public SessionAccept
++{
++public:
++  Http2SessionAccept(Continuation * ep);
++  ~Http2SessionAccept() {}
++
++  void accept(NetVConnection *, MIOBuffer *, IOBufferReader *);
++
++private:
++  int mainEvent(int event, void *netvc);
++  Http2SessionAccept(const Http2SessionAccept &);     // disabled
++  Http2SessionAccept & operator =(const Http2SessionAccept &);        // disabled
++
++  Continuation *endpoint;
++};
++
++#endif /* Http2AcceptCont_H_ */
+diff --git a/proxy/http2/Makefile.am b/proxy/http2/Makefile.am
+new file mode 100644
+index 0000000..7bbce6b
+--- /dev/null
++++ b/proxy/http2/Makefile.am
+@@ -0,0 +1,48 @@
++# Makefile.am for the traffic/iocore/net hierarchy
++#
++#  Licensed to the Apache Software Foundation (ASF) under one
++#  or more contributor license agreements.  See the NOTICE file
++#  distributed with this work for additional information
++#  regarding copyright ownership.  The ASF licenses this file
++#  to you under the Apache License, Version 2.0 (the
++#  "License"); you may not use this file except in compliance
++#  with the License.  You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++
++AM_CPPFLAGS = \
++  $(iocore_include_dirs) \
++  -I$(top_srcdir)/lib \
++  -I$(top_srcdir)/lib/records \
++  -I$(top_srcdir)/lib/ts \
++  -I$(top_srcdir)/proxy \
++  -I$(top_srcdir)/proxy/api \
++  -I$(top_srcdir)/proxy/hdrs \
++  -I$(top_srcdir)/proxy/shared \
++  -I$(top_srcdir)/proxy/http2 \
++  -I$(top_srcdir)/mgmt \
++  -I$(top_srcdir)/mgmt/preparse \
++  -I$(top_srcdir)/mgmt/utils \
++  @NGHTTP2_CFLAGS@
++
++noinst_LIBRARIES = libhttp2.a
++
++libhttp2_a_SOURCES = \
++  Http2SessionAccept.h \
++  Http2SessionAccept.cc
++
++if BUILD_HTTP2
++  libhttp2_a_SOURCES += \
++  Http2Callbacks.cc \
++  Http2Callbacks.h \
++  Http2ClientSession.cc \
++  Http2ClientSession.h \
++  Http2Common.cc \
++  Http2Common.h
++endif
+diff --git a/proxy/logging/Log.cc b/proxy/logging/Log.cc
+index 9ee618e..4f98ee6 100644
+--- a/proxy/logging/Log.cc
++++ b/proxy/logging/Log.cc
+@@ -369,6 +369,7 @@ Log::init_fields()
+                        LogField::sINT,
+                        &LogAccess::marshal_plugin_identity_id,
+                        reinterpret_cast<LogField::UnmarshalFunc>(&LogAccess::unmarshal_int_to_str));
++
+   global_field_list.add(field, false);
+   ink_hash_table_insert(field_symbol_hash, "piid", field);
+ 
