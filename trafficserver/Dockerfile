@@ -94,3 +94,10 @@ RUN ldconfig
 # Configure trafficserver as proxy server of nginx
 #
 RUN echo "map / http://127.0.0.1/" >> /usr/local/etc/trafficserver/remap.config
+RUN openssl genrsa 2048 > server.key &&                                           \
+    yes "" | openssl req -new -key server.key > server.csr &&                        \
+    openssl x509 -days 3650 -req -signkey server.key < server.csr > server.crt && \
+    cp server.crt /usr/local/etc/trafficserver/ &&                                \
+    cp server.key /usr/local/etc/trafficserver/
+RUN echo "CONFIG proxy.config.http.server_ports STRING 8080 443:ssl" >> /usr/local/etc/trafficserver/records.config
+RUN echo "dest_ip=* ssl_cert_name=server.crt ssl_key_name=server.key" >> /usr/local/etc/trafficserver/ssl_multicert.config
